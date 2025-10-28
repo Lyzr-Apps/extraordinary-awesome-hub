@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -82,11 +82,20 @@ interface UploadedJD {
   role: string
 }
 
+interface ChatMessage {
+  id: string
+  type: 'agent' | 'candidate'
+  text: string
+  timestamp: number
+}
+
 function generateId() {
   return Math.random().toString(36).substr(2, 9)
 }
 
 export default function HRScreeningApp() {
+  const scrollRef = useRef<HTMLDivElement>(null)
+
   const [mode, setMode] = useState<AppMode>('home')
   const [candidateStage, setCandidateStage] = useState<CandidateStage>('info')
   const [candidateInfo, setCandidateInfo] = useState<CandidateInfo>({
@@ -95,13 +104,22 @@ export default function HRScreeningApp() {
     phone: '',
     role: '',
   })
-  const [currentQuestion, setCurrentQuestion] = useState(0)
-  const [currentAnswer, setCurrentAnswer] = useState('')
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [currentInput, setCurrentInput] = useState('')
   const [interviewInProgress, setInterviewInProgress] = useState(false)
-  const [interviewResponses, setInterviewResponses] = useState<{ question: string; answer: string }[]>([])
   const [agentResponse, setAgentResponse] = useState<AgentResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [interviewStartTime, setInterviewStartTime] = useState<number | null>(null)
+
+  // Auto-scroll to latest message
+  useEffect(() => {
+    if (scrollRef.current) {
+      setTimeout(() => {
+        scrollRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+      }, 100)
+    }
+  }, [chatMessages, loading])
 
   // HR Dashboard state
   const [uploadedJDs, setUploadedJDs] = useState<UploadedJD[]>([])
@@ -136,7 +154,7 @@ export default function HRScreeningApp() {
   }, [interviewHistory])
 
   // Candidate Interview Handlers
-  const handleStartInterview = () => {
+  const handleStartInterview = async () => {
     if (!candidateInfo.name || !candidateInfo.email || !candidateInfo.phone || !candidateInfo.role) {
       setError('Please fill in all candidate information')
       return
@@ -144,60 +162,64 @@ export default function HRScreeningApp() {
     setError(null)
     setCandidateStage('interview')
     setInterviewInProgress(true)
-    setCurrentQuestion(0)
-    setInterviewResponses([])
-    setCurrentAnswer('')
+    setChatMessages([])
+    setCurrentInput('')
+    setInterviewStartTime(Date.now())
+
+    // Initial greeting from agent
+    try {
+      setLoading(true)
+      const response = await fetch('/api/agent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: `Start a professional HR screening interview for a candidate applying for the ${candidateInfo.role} position. Candidate name: ${candidateInfo.name}. Begin by introducing yourself briefly and asking the first interview question.`,
+          agent_id: '6900bb341b450d08226c4243',
+        }),
+      })
+
+      const data = await response.json()
+      if (data.success) {
+        const agentMessage = typeof data.response === 'string' ? data.response : JSON.stringify(data.response)
+        setChatMessages([
+          {
+            id: generateId(),
+            type: 'agent',
+            text: agentMessage,
+            timestamp: Date.now(),
+          },
+        ])
+      }
+    } catch (err) {
+      setError('Failed to start interview')
+    } finally {
+      setLoading(false)
+    }
   }
 
-  const handleNextQuestion = () => {
-    if (!currentAnswer.trim()) {
-      setError('Please provide an answer before continuing')
-      return
-    }
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!currentInput.trim() || loading) return
 
-    const questions = getInterviewQuestions()
-    setInterviewResponses([...interviewResponses, { question: questions[currentQuestion], answer: currentAnswer }])
-
-    if (currentQuestion < questions.length - 1) {
-      setCurrentQuestion(currentQuestion + 1)
-      setCurrentAnswer('')
-      setError(null)
-    } else {
-      handleCompleteInterview()
-    }
-  }
-
-  const getInterviewQuestions = () => [
-    'Tell us about your experience relevant to this position and what attracted you to this role.',
-    'Describe a challenging project you worked on and how you overcame the obstacles.',
-    'How do you approach collaboration and teamwork in a professional environment?',
-    'What are your key strengths and how do they align with this role?',
-    'Where do you see your career in the next 3-5 years and how does this role fit?',
-    'Do you have any questions for us about the role or company?',
-  ]
-
-  const handleCompleteInterview = async () => {
-    setLoading(true)
     setError(null)
+    const userMessage: ChatMessage = {
+      id: generateId(),
+      type: 'candidate',
+      text: currentInput,
+      timestamp: Date.now(),
+    }
+
+    setChatMessages([...chatMessages, userMessage])
+    setCurrentInput('')
+    setLoading(true)
 
     try {
-      const questions = getInterviewQuestions()
-      const interviewSummary = interviewResponses
-        .map((resp, idx) => `Q${idx + 1}: ${resp.question}\nA: ${resp.answer}`)
-        .join('\n\n')
-
-      const prompt = `You are an HR screening interview agent. Process this candidate interview and provide a detailed evaluation:
-
-Candidate Information:
-- Name: ${candidateInfo.name}
-- Email: ${candidateInfo.email}
-- Phone: ${candidateInfo.phone}
-- Position Applied: ${candidateInfo.role}
-
-Interview Responses:
-${interviewSummary}
-
-Please evaluate this candidate and respond ONLY with a valid JSON object in this exact structure (no markdown, no code blocks, just pure JSON):
+      // Send candidate response to agent for next question or evaluation
+      const response = await fetch('/api/agent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: `Candidate response: "${currentInput}". Continue the interview by either asking the next question OR if you've asked enough questions (typically 5-8), respond with "INTERVIEW_COMPLETE" followed by the JSON evaluation in this exact structure:
 {
   "result": "Interview completed successfully",
   "candidate_info": {
@@ -206,26 +228,26 @@ Please evaluate this candidate and respond ONLY with a valid JSON object in this
     "phone": "${candidateInfo.phone}",
     "role": "${candidateInfo.role}",
     "interview_date": "${new Date().toISOString().split('T')[0]}",
-    "interview_duration": "~${Math.floor(Math.random() * 15) + 25} minutes"
+    "interview_duration": "${Math.round((Date.now() - (interviewStartTime || Date.now())) / 60000)} minutes"
   },
   "evaluation": {
     "overall_score": ${Math.floor(Math.random() * 30) + 70},
     "overall_rating": "Strong Candidate",
-    "questions_asked": ${questions.length},
-    "questions_answered": ${interviewResponses.length},
+    "questions_asked": 6,
+    "questions_answered": 6,
     "question_assessments": [
-      ${interviewResponses.map((resp, idx) => `{
-        "question_number": ${idx + 1},
-        "question": "${resp.question.replace(/"/g, '\\"')}",
-        "candidate_response": "${resp.answer.replace(/"/g, '\\"').substring(0, 200)}",
-        "score": ${Math.floor(Math.random() * 30) + 70},
-        "notes": "Good response with clear examples"
-      }`).join(',\n      ')}
+      {
+        "question_number": 1,
+        "question": "First interview question",
+        "candidate_response": "Candidate's response summary",
+        "score": 80,
+        "notes": "Strong response"
+      }
     ],
-    "strengths": ["Strong communication skills", "Relevant technical experience", "Clear career goals"],
-    "concerns": ["Limited experience in specific area"],
-    "recommendation": "Move to next interview round",
-    "summary": "Candidate demonstrated solid understanding of role requirements with good communication skills."
+    "strengths": ["Strong communication", "Technical expertise", "Problem-solving skills"],
+    "concerns": ["Limited experience in area X"],
+    "recommendation": "Move to next round",
+    "summary": "Candidate demonstrated strong fit for the role."
   },
   "email_status": {
     "sent": true,
@@ -239,49 +261,69 @@ Please evaluate this candidate and respond ONLY with a valid JSON object in this
     "knowledge_base_used": "HR Screening Interview Agent",
     "jd_matched": "Yes"
   }
-}`
-
-      const response = await fetch('/api/agent', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: prompt,
+}`,
           agent_id: '6900bb341b450d08226c4243',
         }),
       })
 
       const data = await response.json()
+      if (data.success) {
+        const agentText = typeof data.response === 'string' ? data.response : JSON.stringify(data.response)
 
-      if (!data.success) {
-        throw new Error(data.error || 'Failed to process interview')
+        // Check if interview is complete
+        if (agentText.includes('INTERVIEW_COMPLETE')) {
+          try {
+            const jsonMatch = agentText.match(/\{[\s\S]*\}/)
+            if (jsonMatch) {
+              const evaluation = JSON.parse(jsonMatch[0])
+              setAgentResponse(evaluation)
+
+              const newRecord: InterviewRecord = {
+                id: generateId(),
+                candidate_name: candidateInfo.name,
+                email: candidateInfo.email,
+                role: candidateInfo.role,
+                date: new Date().toLocaleDateString(),
+                overall_score: evaluation.evaluation.overall_score,
+                overall_rating: evaluation.evaluation.overall_rating,
+                recommendation: evaluation.evaluation.recommendation,
+                evaluation: evaluation.evaluation,
+                candidate_info: evaluation.candidate_info,
+              }
+
+              setInterviewHistory([newRecord, ...interviewHistory])
+              setCandidateStage('completion')
+              setInterviewInProgress(false)
+
+              // Add completion message
+              setChatMessages((prev) => [
+                ...prev,
+                {
+                  id: generateId(),
+                  type: 'agent',
+                  text: 'Thank you for completing the interview! Your evaluation is being processed.',
+                  timestamp: Date.now(),
+                },
+              ])
+            }
+          } catch (parseErr) {
+            setError('Failed to parse evaluation results')
+          }
+        } else {
+          // Continue interview
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              id: generateId(),
+              type: 'agent',
+              text: agentText,
+              timestamp: Date.now(),
+            },
+          ])
+        }
       }
-
-      let parsedResponse = data.response
-      if (typeof parsedResponse === 'string') {
-        parsedResponse = JSON.parse(parsedResponse)
-      }
-
-      setAgentResponse(parsedResponse)
-
-      const newRecord: InterviewRecord = {
-        id: generateId(),
-        candidate_name: candidateInfo.name,
-        email: candidateInfo.email,
-        role: candidateInfo.role,
-        date: new Date().toLocaleDateString(),
-        overall_score: parsedResponse.evaluation.overall_score,
-        overall_rating: parsedResponse.evaluation.overall_rating,
-        recommendation: parsedResponse.evaluation.recommendation,
-        evaluation: parsedResponse.evaluation,
-        candidate_info: parsedResponse.candidate_info,
-      }
-
-      setInterviewHistory([newRecord, ...interviewHistory])
-      setCandidateStage('completion')
-      setInterviewInProgress(false)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to process interview')
-      setInterviewInProgress(false)
+      setError('Failed to process response. Please try again.')
     } finally {
       setLoading(false)
     }
@@ -290,8 +332,8 @@ Please evaluate this candidate and respond ONLY with a valid JSON object in this
   const handleReset = () => {
     setCandidateInfo({ name: '', email: '', phone: '', role: '' })
     setCandidateStage('info')
-    setCurrentQuestion(0)
-    setCurrentAnswer('')
+    setChatMessages([])
+    setCurrentInput('')
     setAgentResponse(null)
     setError(null)
     setMode('home')
@@ -504,55 +546,70 @@ Please evaluate this candidate and respond ONLY with a valid JSON object in this
 
           {/* Interview Stage */}
           {candidateStage === 'interview' && (
-            <Card>
-              <CardContent className="pt-8">
-                <div className="space-y-6">
-                  {/* Question */}
-                  <div className="space-y-3">
-                    <p className="text-sm font-medium text-gray-500">Question {currentQuestion + 1}</p>
-                    <p className="text-lg font-semibold text-gray-900">
-                      {getInterviewQuestions()[currentQuestion]}
-                    </p>
-                  </div>
+            <Card className="flex flex-col h-[600px]">
+              <CardHeader className="border-b">
+                <CardTitle>Interview Chat</CardTitle>
+                <CardDescription>Respond to questions from your interviewer</CardDescription>
+              </CardHeader>
 
-                  {/* Answer Area */}
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-700">Your Answer</label>
-                    <Textarea
-                      placeholder="Please provide your answer here..."
-                      value={currentAnswer}
-                      onChange={(e) => setCurrentAnswer(e.target.value)}
-                      className="min-h-32"
-                      disabled={loading}
-                    />
-                    <p className="text-xs text-gray-500">Minimum 10 characters recommended</p>
-                  </div>
-
-                  {/* Navigation Buttons */}
-                  <div className="flex gap-3 pt-4">
-                    <Button
-                      variant="outline"
-                      disabled={loading || currentQuestion === 0}
-                      onClick={() => {
-                        if (currentQuestion > 0) {
-                          setCurrentQuestion(currentQuestion - 1)
-                          setCurrentAnswer(interviewResponses[currentQuestion - 1]?.answer || '')
+              {/* Chat Messages */}
+              <ScrollArea className="flex-1">
+                <div className="p-6 space-y-4">
+                  {chatMessages.map((msg) => (
+                    <div
+                      key={msg.id}
+                      className={`flex ${msg.type === 'agent' ? 'justify-start' : 'justify-end'}`}
+                    >
+                      <div
+                        className="rounded-lg p-4 max-w-xs md:max-w-md lg:max-w-lg break-words"
+                        style={msg.type === 'agent'
+                          ? { backgroundColor: colors.lightGray, color: colors.darkGray }
+                          : { backgroundColor: colors.primary, color: 'white' }
                         }
-                      }}
-                    >
-                      Previous
-                    </Button>
-                    <Button
-                      className="flex-1"
-                      style={{ backgroundColor: colors.primary }}
-                      onClick={handleNextQuestion}
-                      disabled={loading || !currentAnswer.trim()}
-                    >
-                      {loading ? 'Processing...' : currentQuestion === getInterviewQuestions().length - 1 ? 'Submit Interview' : 'Next Question'}
-                    </Button>
-                  </div>
+                      >
+                        <p className="text-sm whitespace-pre-wrap">{msg.text}</p>
+                      </div>
+                    </div>
+                  ))}
+                  {loading && (
+                    <div className="flex justify-start">
+                      <div className="rounded-lg p-4" style={{ backgroundColor: colors.lightGray }}>
+                        <p className="text-sm" style={{ color: colors.darkGray }}>Agent is thinking...</p>
+                      </div>
+                    </div>
+                  )}
+                  <div ref={scrollRef} />
                 </div>
-              </CardContent>
+              </ScrollArea>
+
+              {/* Error Alert */}
+              {error && (
+                <div className="px-6 py-3 border-t border-red-200" style={{ backgroundColor: '#FEE2E2' }}>
+                  <p className="text-sm text-red-700 flex items-start gap-2">
+                    <AlertCircle size={16} className="flex-shrink-0 mt-0.5" />
+                    {error}
+                  </p>
+                </div>
+              )}
+
+              {/* Input Area */}
+              <form onSubmit={handleSendMessage} className="border-t p-6 space-y-3">
+                <Textarea
+                  placeholder="Type your response here..."
+                  value={currentInput}
+                  onChange={(e) => setCurrentInput(e.target.value)}
+                  className="min-h-20"
+                  disabled={loading}
+                />
+                <Button
+                  type="submit"
+                  className="w-full"
+                  style={{ backgroundColor: colors.primary }}
+                  disabled={loading || !currentInput.trim() || !interviewInProgress}
+                >
+                  {loading ? 'Sending...' : 'Send Response'}
+                </Button>
+              </form>
             </Card>
           )}
 
